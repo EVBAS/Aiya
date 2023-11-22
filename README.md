@@ -1,2 +1,2 @@
-# Aiya
-seq2seq structure
+# Aiya structure
+This is the example of Aiya's structure
