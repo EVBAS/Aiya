@@ -1,66 +1,85 @@
+import collections
+import  math
+
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
 
-class HanAttentionEncoder(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(HanAttentionEncoder, self).__init__()
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        self.self_attention = nn.MultiheadAttention(hidden_size, num_heads=1)
-        self.gru = nn.GRU(hidden_size, hidden_size)
+class attention(nn.Module):
+    def __init__(self, hidden_size):
+        super(attention, self).__init__()
+        self.linear = nn.Linear(hidden_size * 2, hidden_size)
 
-    def forward(self, encoder_input, gpu):
-        encoder_input = encoder_input.to(gpu)
-        embedded = self.embedding(encoder_input).view(1, -1, self.hidden_size)
-        embedded = F.relu(embedded)
-        attn_output, _ = self.self_attention(embedded, embedded, embedded)
-        output = F.relu(attn_output)
-        output, hidden = self.gru(output)
+    def forward(self, decoder_hidden, encoder_outputs):
+        attn_scores = torch.bmm(encoder_outputs.permute(1, 0, 2), decoder_hidden.unsqueeze(2)).squeeze(2)
+        attn_weights = nn.functional.softmax(attn_scores, dim=0)
 
+        context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs.permute(1, 0, 2)).squeeze(1)
+
+        attended_input = torch.cat([context, decoder_hidden], dim=1)
+        attention_output = torch.tanh(self.linear(attended_input))
+
+        return attention_output
+
+class encoder(nn.Module):
+    def __init__(self, vocab_size, hidden_size, emb_size, layer_num, dropout=0):
+        super(encoder, self).__init__()
+
+        self.embedding = nn.Embedding(vocab_size, emb_size)
+        self.gru = nn.GRU(emb_size, hidden_size, layer_num, dropout=dropout)
+
+    def forward(self, input_seq):
+        if len(input_seq.shape) == 3:
+            input_seq = input_seq.view(-1, input_seq.size(2))
+        # print(input_seq)
+        seq = self.embedding(input_seq.long().clone().detach())
+        seq = seq.permute(1, 0, 2)
+        output, hidden = self.gru(seq)
+        # print(output.shape)
+        # print(hidden.shape)
         return output, hidden
+        
+class decoder(nn.Module):
+    def __init__(self, vocab_size, hidden_size, emb_size, layer_num, dropout=0):
+        super(decoder, self).__init__()
 
-class HanAttentionDecoder(nn.Module):
-    def __init__(self, output_size, hidden_size):
-        super(HanAttentionDecoder, self).__init__()
-        self.output_size = output_size
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.attn = nn.Linear(hidden_size * 2, hidden_size)
-        self.attn_combine = nn.Linear(hidden_size * 2, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
-        self.fc = nn.Linear(hidden_size, output_size)
+        self.embedding = nn.Embedding(vocab_size, emb_size)
+        self.gru = nn.GRU(emb_size + hidden_size, hidden_size, layer_num, dropout=dropout)
+        self.com = nn.Linear(hidden_size, vocab_size)
+        self.attention = attention(hidden_size)
 
-    def forward(self, decoder_input, hidden, encoder_output, gpu):
-        decoder_input = decoder_input.to(gpu)
-        hidden = hidden.to(gpu)
-        encoder_output = encoder_output.to(gpu)
-        embedded = self.embedding(decoder_input).view(1, -1, self.hidden_size)
-        attn_weights = torch.softmax(self.attn(torch.cat((embedded[0], hidden[0]), 1)), dim=1)
-        attn_applied = torch.bmm(attn_weights.unsqueeze(0), encoder_output.transpose(0, 1))
-        output = torch.cat((embedded[0], attn_applied[0]), 1)
-        output = self.attn_combine(output).unsqueeze(0)
-        output = F.relu(output)
-        output, hidden = self.gru(output, hidden)
-        output = torch.sigmoid(self.fc(output[0]))
+    def init_state(self, enc_output):
+        return enc_output[1]
 
-        return output, hidden, attn_weights
+    def forward(self, input_seq, state, encoder_outputs, word2vec_model):
+        if len(input_seq.shape) == 3:
+            input_seq = input_seq.view(-1, input_seq.size(2))
 
-class Seq2Seq(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size):
-        super(Seq2Seq, self).__init__()
-        self.encoder = HanAttentionEncoder(input_size, hidden_size)
-        self.decoder = HanAttentionDecoder(output_size, hidden_size)
+        seq = self.embedding(input_seq.long().clone().detach())
+        seq = seq.permute(1, 0, 2)
 
-    def forward(self, input_seq, target_seq, gpu):
-        encoder_output, encoder_hidden = self.encoder(input_seq, gpu)
-        decoder_input = target_seq[:, 0].unsqueeze(1)
-        decoder_hidden = encoder_hidden
-        loss = 0
-        for di in range(target_seq.size(1)):
-            decoder_output, decoder_hidden, _ = self.decoder(decoder_input, decoder_hidden, encoder_output, gpu)
-            loss += F.cross_entropy(decoder_output.squeeze(0), target_seq[:, di])
-            decoder_input = target_seq[:, di].unsqueeze(1)
+        attention_output = self.attention(state[-1], encoder_outputs)
+        attention_output = attention_output.unsqueeze(0)
+        # print("seq size:", seq.size())
+        # print("attention_output size:", attention_output.size())
+        # print("seq.size(0):", seq.size(0))
+        seq = torch.cat([seq, attention_output.repeat(seq.size(0), 1, 1)], dim=2)
+        output, hidden = self.gru(seq, state)
+        output = self.com(output).permute(1, 0, 2)
+        pos_word = nn.functional.softmax(output, dim=2)
 
-        return loss
+        batch_size, max_length, vocab_size = pos_word.shape
+        words = []
+
+        for i in range(batch_size):
+            sentence_words = []
+            for j in range(max_length):
+                word_index = np.random.choice(vocab_size, p=pos_word[i, j, :].detach().numpy())
+                word = word2vec_model.index_to_key[word_index]
+                sentence_words.append(word)
+
+            words.append(sentence_words)
+            sentence = [" ".join(word) for word in words]
+
+        return output, hidden, pos_word, sentence
       
